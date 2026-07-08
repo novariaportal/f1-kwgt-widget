@@ -98,8 +98,10 @@ async def fetch_current_year_sessions(year: int) -> list[dict[str, Any]]:
         async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.get(OPENF1_SESSIONS_ENDPOINT, params={"year": year})
             response.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise RuntimeError(f"OpenF1 request failed: {exc}") from exc
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(f"OpenF1 request failed with status {exc.response.status_code}") from exc
+    except httpx.RequestError as exc:
+        raise RuntimeError("OpenF1 request failed due to a network error") from exc
 
     data = response.json()
     if not isinstance(data, list):
@@ -139,10 +141,17 @@ async def get_schedule() -> dict[str, Any]:
             "fetched_at": fetched_at.isoformat(),
             "sessions": sessions,
         }
-    except Exception as exc:
+    except RuntimeError as exc:
         return {
             "refresh_rate": REFRESH_IDLE_SECONDS,
             "fetched_at": utc_now().isoformat(),
             "sessions": [],
             "error": str(exc),
+        }
+    except Exception:
+        return {
+            "refresh_rate": REFRESH_IDLE_SECONDS,
+            "fetched_at": utc_now().isoformat(),
+            "sessions": [],
+            "error": "Unexpected server error while building schedule",
         }
