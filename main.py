@@ -141,12 +141,12 @@ async def get_schedule() -> dict[str, Any]:
             "fetched_at": fetched_at.isoformat(),
             "sessions": sessions,
         }
-    except RuntimeError as exc:
+    except RuntimeError:
         return {
             "refresh_rate": REFRESH_IDLE_SECONDS,
             "fetched_at": utc_now().isoformat(),
             "sessions": [],
-            "error": str(exc),
+            "error": "Failed to fetch OpenF1 sessions",
         }
     except Exception:
         return {
