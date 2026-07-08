@@ -6,9 +6,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 
 OPENF1_BASE_URL = os.getenv("OPENF1_BASE_URL", "https://api.openf1.org/v1")
+OPENF1_SESSIONS_ENDPOINT = f"{OPENF1_BASE_URL}/sessions"
 REFRESH_ACTIVE_SECONDS = 5
 REFRESH_IDLE_SECONDS = 7200
 
@@ -21,7 +22,7 @@ class ScheduleCache:
 
 
 cache = ScheduleCache()
-app = FastAPI(title="F1 KWGT Adaptive Cache API", version="1.0.0")
+app = FastAPI(title="F1 KWGT Schedule API", version="1.0.0")
 
 
 def utc_now() -> datetime:
@@ -32,9 +33,8 @@ def parse_openf1_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
 
-    normalized = value.replace("Z", "+00:00")
     try:
-        parsed = datetime.fromisoformat(normalized)
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
 
@@ -52,103 +52,97 @@ def is_active_session(session: dict[str, Any], now: datetime) -> bool:
 
 
 def infer_refresh_rate(sessions: list[dict[str, Any]], now: datetime) -> int:
+    return REFRESH_ACTIVE_SECONDS if any(is_active_session(session, now) for session in sessions) else REFRESH_IDLE_SECONDS
+
+
+def build_round_map(sessions: list[dict[str, Any]]) -> dict[Any, int]:
+    meetings: list[tuple[datetime, Any]] = []
+    seen_meetings: set[Any] = set()
+
     for session in sessions:
-        if is_active_session(session, now):
-            return REFRESH_ACTIVE_SECONDS
-    return REFRESH_IDLE_SECONDS
+        meeting_key = session.get("meeting_key")
+        start = parse_openf1_datetime(session.get("date_start"))
+        if meeting_key is None or not start or meeting_key in seen_meetings:
+            continue
+        seen_meetings.add(meeting_key)
+        meetings.append((start, meeting_key))
+
+    meetings.sort(key=lambda item: item[0])
+    return {meeting_key: index for index, (_, meeting_key) in enumerate(meetings, start=1)}
 
 
-async def fetch_current_year_schedule(year: int) -> list[dict[str, Any]]:
-    url = f"{OPENF1_BASE_URL}/sessions"
-    params = {"year": year}
+def flatten_sessions(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    round_by_meeting = build_round_map(sessions)
+    flattened: list[dict[str, Any]] = []
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        response = await client.get(url, params=params)
-
-    if response.status_code != 200:
-        raise HTTPException(
-            status_code=502,
-            detail=f"OpenF1 returned {response.status_code} while fetching sessions",
+    for session in sessions:
+        meeting_key = session.get("meeting_key")
+        flattened.append(
+            {
+                "name": session.get("session_name") or session.get("session_type"),
+                "session_type": session.get("session_type"),
+                "date_start": session.get("date_start"),
+                "date_end": session.get("date_end"),
+                "round": session.get("round_number") or round_by_meeting.get(meeting_key),
+                "circuit": session.get("circuit_short_name") or session.get("location"),
+                "country": session.get("country_name"),
+            }
         )
+
+    flattened.sort(key=lambda item: parse_openf1_datetime(item.get("date_start")) or datetime.max.replace(tzinfo=timezone.utc))
+    return flattened
+
+
+async def fetch_current_year_sessions(year: int) -> list[dict[str, Any]]:
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.get(OPENF1_SESSIONS_ENDPOINT, params={"year": year})
+            response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"OpenF1 request failed: {exc}") from exc
 
     data = response.json()
     if not isinstance(data, list):
-        raise HTTPException(status_code=502, detail="Unexpected OpenF1 schedule response")
+        raise RuntimeError("Unexpected OpenF1 sessions response shape")
 
     return data
 
 
-async def get_schedule_with_adaptive_cache() -> tuple[list[dict[str, Any]], int, bool]:
+async def get_schedule_with_adaptive_cache() -> tuple[list[dict[str, Any]], int, datetime]:
     now = utc_now()
     current_year = now.year
 
-    if cache.year == current_year and cache.sessions is not None and cache.fetched_at is not None:
-        dynamic_ttl = infer_refresh_rate(cache.sessions, now)
-        age = (now - cache.fetched_at).total_seconds()
-        if age < dynamic_ttl:
-            return cache.sessions, dynamic_ttl, False
+    if cache.year == current_year and cache.fetched_at and cache.sessions is not None:
+        cached_refresh_rate = infer_refresh_rate(cache.sessions, now)
+        age_seconds = (now - cache.fetched_at).total_seconds()
+        if age_seconds < cached_refresh_rate:
+            return cache.sessions, cached_refresh_rate, cache.fetched_at
 
-    sessions = await fetch_current_year_schedule(current_year)
+    raw_sessions = await fetch_current_year_sessions(current_year)
+    flattened_sessions = flatten_sessions(raw_sessions)
+    refresh_rate = infer_refresh_rate(flattened_sessions, now)
+
     cache.year = current_year
     cache.fetched_at = now
-    cache.sessions = sessions
+    cache.sessions = flattened_sessions
 
-    refresh_rate = infer_refresh_rate(sessions, now)
-    return sessions, refresh_rate, True
-
-
-def flatten_sessions(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    flattened = []
-    for session in sessions:
-        flattened.append(
-            {
-                "session_key": session.get("session_key"),
-                "meeting_key": session.get("meeting_key"),
-                "session_name": session.get("session_name"),
-                "session_type": session.get("session_type"),
-                "country_name": session.get("country_name"),
-                "location": session.get("location"),
-                "circuit_short_name": session.get("circuit_short_name"),
-                "date_start": session.get("date_start"),
-                "date_end": session.get("date_end"),
-                "gmt_offset": session.get("gmt_offset"),
-            }
-        )
-    return flattened
-
-
-def find_next_session(sessions: list[dict[str, Any]], now: datetime) -> dict[str, Any] | None:
-    upcoming: list[tuple[datetime, dict[str, Any]]] = []
-    for session in sessions:
-        start = parse_openf1_datetime(session.get("date_start"))
-        if start and start > now:
-            upcoming.append((start, session))
-
-    if not upcoming:
-        return None
-
-    upcoming.sort(key=lambda item: item[0])
-    return upcoming[0][1]
+    return flattened_sessions, refresh_rate, now
 
 
 @app.get("/")
 @app.get("/schedule")
 async def get_schedule() -> dict[str, Any]:
-    now = utc_now()
-    sessions, refresh_rate, _ = await get_schedule_with_adaptive_cache()
-    flattened = flatten_sessions(sessions)
-
-    active_sessions = [session for session in flattened if is_active_session(session, now)]
-    next_session = find_next_session(flattened, now)
-
-    return {
-        "refresh_rate": refresh_rate,
-        "timestamp_utc": now.isoformat(),
-        "year": now.year,
-        "active": len(active_sessions) > 0,
-        "active_session_count": len(active_sessions),
-        "active_sessions": active_sessions,
-        "next_session": next_session,
-        "session_count": len(flattened),
-        "sessions": flattened,
-    }
+    try:
+        sessions, refresh_rate, fetched_at = await get_schedule_with_adaptive_cache()
+        return {
+            "refresh_rate": int(refresh_rate),
+            "fetched_at": fetched_at.isoformat(),
+            "sessions": sessions,
+        }
+    except Exception as exc:
+        return {
+            "refresh_rate": REFRESH_IDLE_SECONDS,
+            "fetched_at": utc_now().isoformat(),
+            "sessions": [],
+            "error": str(exc),
+        }
